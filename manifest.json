@@ -1,0 +1,10 @@
+{
+  "id": "rfa-pdf-export",
+  "name": "Exporter en PDF",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Exporte la note courante en PDF",
+  "author": "Richard Fagot",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

@@ -1,0 +1,8 @@
+{
+  "pandocPath": "C:\\RFA\\Projets\\md2pdf\\pandoc-3.10\\pandoc.exe",
+  "typstPath": "C:\\RFA\\Projets\\md2pdf\\typst-3.14.2\\typst.exe",
+  "templateDir": "",
+  "outputDir": "O:\\POLE_PROJET\\00_Projets\\Espace SDIS et Collectivité\\v1\\03_Specifications_generales",
+  "openAfter": true,
+  "pdfViewer": "C:\\RFA\\Apps\\PDF-XChange\\PXCEditor.exe"
+}
