@@ -113,6 +113,58 @@ function todayFR() {
   return `${dd}/${mm}/${yyyy}`;
 }
 
+/** Dimensions en pixels d'une image ({ width, height }), lues dans l'en-tête
+ *  du fichier (PNG, JPEG, GIF, BMP, WebP). null si format non reconnu (SVG…)
+ *  ou fichier illisible : Typst déduit alors la taille du DPI du fichier.
+ *  Sert à reproduire l'affichage d'Obsidian, qui ignore le DPI (1 px = 1 px
+ *  CSS = 0,75 pt), alors que Typst s'y fie (sans DPI : 1 px = 1 pt). */
+function readImagePixelSize(absPath) {
+  let b;
+  try {
+    const fd = fs.openSync(absPath, "r");
+    try {
+      b = Buffer.alloc(Math.min(fs.fstatSync(fd).size, 256 * 1024));
+      fs.readSync(fd, b, 0, b.length, 0);
+    } finally { fs.closeSync(fd); }
+  } catch (_) { return null; }
+  const ok = (w, h) => (w > 0 && h > 0 ? { width: w, height: h } : null);
+  const ascii = (o, n) => b.toString("latin1", o, o + n);
+  if (b.length >= 24 && b.readUInt32BE(0) === 0x89504e47) {          // PNG
+    return ok(b.readUInt32BE(16), b.readUInt32BE(20));
+  }
+  if (b.length >= 10 && ascii(0, 3) === "GIF") {                      // GIF
+    return ok(b.readUInt16LE(6), b.readUInt16LE(8));
+  }
+  if (b.length >= 26 && ascii(0, 2) === "BM") {                       // BMP
+    return ok(Math.abs(b.readInt32LE(18)), Math.abs(b.readInt32LE(22)));
+  }
+  if (b.length >= 30 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
+    const fmt = ascii(12, 4);
+    if (fmt === "VP8 ") return ok(b.readUInt16LE(26) & 0x3fff, b.readUInt16LE(28) & 0x3fff);
+    if (fmt === "VP8L") {
+      const v = b.readUInt32LE(21);
+      return ok((v & 0x3fff) + 1, ((v >> 14) & 0x3fff) + 1);
+    }
+    if (fmt === "VP8X") return ok(b.readUIntLE(24, 3) + 1, b.readUIntLE(27, 3) + 1);
+    return null;
+  }
+  if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {             // JPEG
+    // Parcours des segments jusqu'au SOFn (hors DHT C4, JPG C8, DAC CC).
+    // L'orientation EXIF (photo « tournée ») n'est pas prise en compte.
+    let o = 2;
+    while (o + 9 < b.length) {
+      if (b[o] !== 0xff) return null;
+      const m = b[o + 1];
+      if (m === 0xff) { o++; continue; }
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) {
+        return ok(b.readUInt16BE(o + 7), b.readUInt16BE(o + 5));
+      }
+      o += 2 + b.readUInt16BE(o + 2);
+    }
+  }
+  return null;
+}
+
 /** Noms candidats pour un exécutable selon la plateforme.
  *  Sous Windows on essaie .exe / .cmd / .bat puis le nom nu. */
 function exeCandidates(base) {
@@ -338,20 +390,33 @@ class PandocTypstExportPlugin extends Plugin {
       ? `#import "obsidian.typ": callout, horizontalrule, obs-table\n`
       : "";
 
-    // obs-image : image redimensionnée « à la Obsidian » (![[img.png|300]],
-    // ![[img.png|300x200]]). Les dimensions sont des PLAFONDS : l'image est
-    // mise à l'échelle (ratio conservé) pour tenir dans la boîte w × h, et
-    // jamais plus large que la largeur disponible (colonne, cellule…).
+    // obs-image : TOUTE image de la note passe par cette fonction (cf. § 10-bis).
+    // Taille affichée = la plus petite des contraintes suivantes (ratio
+    // toujours conservé, jamais d'agrandissement) :
+    //   • taille naturelle « Obsidian » : 1 px = 0,75 pt, comme à l'écran
+    //     (px = dimensions en pixels lues dans le fichier ; à défaut, taille
+    //     déduite par Typst du DPI du fichier) ;
+    //   • w / h : taille indiquée dans la note (![[img.png|300]] ou
+    //     |300x200), en px convertis en pt — c'est un MAXIMUM ;
+    //   • largeur disponible (colonne, cellule…) ;
+    //   • hauteur de la zone de texte de la page, moins une réserve pour la
+    //     légende d'une figure (OBS_IMAGE_CAPTION_RESERVE).
     // Défini ici (et non dans obsidian.typ) pour ne pas dépendre du modèle,
     // et parce que les chemins d'image sont résolus par rapport au fichier
     // qui appelle image() : document.typ, à la racine de tmpDir.
     // ATTENTION : template Pandoc → aucun « $ » dans ce code.
+    const OBS_IMAGE_CAPTION_RESERVE = "4em";
     const obsImageDef =
-      `#let obs-image(path, w: none, h: none, alt: none) = layout(size => {\n` +
-      `  let nat = measure(image(path))\n` +
-      `  let ratios = (size.width / nat.width,)\n` +
+      `#let obs-image(path, px: none, w: none, h: none, alt: none) = layout(size => {\n` +
+      `  let nat = if px != none { (width: px.at(0) * 0.75pt, height: px.at(1) * 0.75pt) }\n` +
+      `            else { measure(image(path)) }\n` +
+      `  let ratios = (1.0, size.width / nat.width)\n` +
       `  if w != none { ratios.push(w / nat.width) }\n` +
       `  if h != none { ratios.push(h / nat.height) }\n` +
+      `  if size.height < float.inf * 1pt {\n` +
+      `    let max-h = (size.height - ${OBS_IMAGE_CAPTION_RESERVE}).to-absolute()\n` +
+      `    if max-h > 0pt { ratios.push(max-h / nat.height) }\n` +
+      `  }\n` +
       `  image(path, width: nat.width * calc.min(..ratios), alt: alt)\n` +
       `})\n`;
 
@@ -527,19 +592,21 @@ class PandocTypstExportPlugin extends Plugin {
     };
     // px CSS (unité d'Obsidian) → pt Typst : 1 px = 0,75 pt (96 dpi).
     const pxToPt = (px) => `${+(px * 0.75).toFixed(2)}pt`;
-    // Image redimensionnée : Pandoc ne sait que FORCER une taille (et en
-    // pouces), pas la plafonner. On émet donc une image Markdown ORDINAIRE
+    // Dimensionnement des images : Pandoc ne sait que FORCER une taille (et
+    // en pouces), pas la plafonner. On émet donc une image Markdown ORDINAIRE
     // — Pandoc garde la main sur la figure, la légende (mise en forme
-    // Markdown comprise) et le label, exactement comme sans taille — mais
-    // vers un chemin MARQUEUR unique (« obs-sized-N/images/… »). Après Pandoc,
-    // le § 10 remplace  image("marqueur"  par  obs-image("chemin", w:…, h:…
-    // (défini dans le template généré, cf. § 5).
+    // Markdown comprise) et le label — mais vers un chemin MARQUEUR unique
+    // (« obs-sized-N/images/… »). Après Pandoc, le § 10-bis remplace
+    //   image("marqueur"  par  obs-image("chemin", px: …, w: …, h: …
+    // (défini dans le template généré, cf. § 5). Toutes les images sont
+    // concernées, avec ou sans taille, pour qu'aucune ne déborde de la page.
     const sizedImages = new Map();   // marqueur → appel obs-image( sans « ) »
-    const sizedImagePath = (rel, w, h) => {
-      if (w === null && h === null) return rel;
+    const sizedImagePath = (absPath, rel, w, h) => {
+      const px = readImagePixelSize(absPath);
       const marker = `obs-sized-${sizedImages.size}/${rel}`;
       sizedImages.set(marker,
         `obs-image(${typstStr(rel)}` +
+        (px ? `, px: (${px.width}, ${px.height})` : "") +
         (w !== null ? `, w: ${pxToPt(w)}` : "") +
         (h !== null ? `, h: ${pxToPt(h)}` : ""));
       return marker;
@@ -601,8 +668,8 @@ class PandocTypstExportPlugin extends Plugin {
       // Lignes vides autour : Pandoc exige que l'image soit SEULE dans son
       // paragraphe pour la promouvoir en figure (sinon le label n'existe pas
       // et tout renvoi @${id} ferait échouer la compilation Typst).
-      // Taille éventuelle : cf. sizedImagePath().
-      return `\n${lead}![${caption}](${sizedImagePath(rel, w, h)}){#${id}}\n`;
+      // Dimensionnement : cf. sizedImagePath().
+      return `\n${lead}![${caption}](${sizedImagePath(found, rel, w, h)}){#${id}}\n`;
     });
 
     // Recenser les ancres réellement définies dans la note (les deux formes),
@@ -638,10 +705,10 @@ class PandocTypstExportPlugin extends Plugin {
           if (found) {
             const rel = stageImage(found);
             if (rel) {
-              // Taille éventuelle : cf. sizedImagePath(). Une image seule
-              // dans son paragraphe avec un alt devient, comme sans taille,
-              // une figure légendée (implicit_figures de Pandoc).
-              return `![${alt}](${sizedImagePath(rel, w, h)})`;
+              // Dimensionnement : cf. sizedImagePath(). Une image seule
+              // dans son paragraphe avec un alt devient une figure légendée
+              // (implicit_figures de Pandoc).
+              return `![${alt}](${sizedImagePath(found, rel, w, h)})`;
             }
             new Notice(`Image illisible : ${filename}`, 6000);
             return `*(image illisible : ${filename})*`;
@@ -896,9 +963,9 @@ class PandocTypstExportPlugin extends Plugin {
         //                        préfixée de « # » dans la sortie de Pandoc ;
         //   • `table.header(`, `table.hline()` s'écrivent SANS « # » et ne sont
         //     donc jamais touchés par la substitution.
-        // ── 10-bis. Images redimensionnées → obs-image() ────────────────
+        // ── 10-bis. Images → obs-image() ────────────────────────────────
         // Chaque  image("obs-sized-N/…"  (chemin marqueur, cf. sizedImagePath)
-        // devient  obs-image("…", w: …, h: …  ; les arguments éventuellement
+        // devient  obs-image("…", px: …, w: …, h: …  ; les arguments éventuellement
         // ajoutés par Pandoc (alt…) et la parenthèse fermante sont conservés.
         try {
           if (hasObsidianLib || sizedImages.size) {
