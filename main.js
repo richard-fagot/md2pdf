@@ -527,13 +527,23 @@ class PandocTypstExportPlugin extends Plugin {
     };
     // px CSS (unité d'Obsidian) → pt Typst : 1 px = 0,75 pt (96 dpi).
     const pxToPt = (px) => `${+(px * 0.75).toFixed(2)}pt`;
-    // Appel Typst à obs-image() (défini dans le template généré, cf. § 5).
-    const obsImageCall = (rel, w, h, alt) =>
-      `obs-image(${typstStr(rel)}` +
-      (w !== null ? `, w: ${pxToPt(w)}` : "") +
-      (h !== null ? `, h: ${pxToPt(h)}` : "") +
-      (alt ? `, alt: ${typstStr(alt)}` : "") +
-      `)`;
+    // Image redimensionnée : Pandoc ne sait que FORCER une taille (et en
+    // pouces), pas la plafonner. On émet donc une image Markdown ORDINAIRE
+    // — Pandoc garde la main sur la figure, la légende (mise en forme
+    // Markdown comprise) et le label, exactement comme sans taille — mais
+    // vers un chemin MARQUEUR unique (« obs-sized-N/images/… »). Après Pandoc,
+    // le § 10 remplace  image("marqueur"  par  obs-image("chemin", w:…, h:…
+    // (défini dans le template généré, cf. § 5).
+    const sizedImages = new Map();   // marqueur → appel obs-image( sans « ) »
+    const sizedImagePath = (rel, w, h) => {
+      if (w === null && h === null) return rel;
+      const marker = `obs-sized-${sizedImages.size}/${rel}`;
+      sizedImages.set(marker,
+        `obs-image(${typstStr(rel)}` +
+        (w !== null ? `, w: ${pxToPt(w)}` : "") +
+        (h !== null ? `, h: ${pxToPt(h)}` : ""));
+      return marker;
+    };
 
     // Motifs d'ancre reconnus :
     //   1. ^id  seul sur sa ligne, ou en fin de ligne précédé d'une espace.
@@ -588,23 +598,11 @@ class PandocTypstExportPlugin extends Plugin {
           6000
         );
       }
-      // Image redimensionnée → figure émise directement en Typst brut, car
-      // Pandoc ne sait que FORCER une taille (et en pouces), pas la plafonner.
-      // `kind: image` est explicite : le corps (layout) empêche la détection
-      // automatique du type de figure, nécessaire à la numérotation « Fig. N ».
-      // La légende est passée en texte brut (pas de mise en forme Markdown).
-      if (w !== null || h !== null) {
-        return (
-          `\n${lead}\`\`\`{=typst}\n` +
-          `${lead}#figure(${obsImageCall(rel, w, h, caption)}, kind: image, ` +
-          `caption: [#${typstStr(caption)}]) <${id}>\n` +
-          `${lead}\`\`\`\n`
-        );
-      }
       // Lignes vides autour : Pandoc exige que l'image soit SEULE dans son
       // paragraphe pour la promouvoir en figure (sinon le label n'existe pas
       // et tout renvoi @${id} ferait échouer la compilation Typst).
-      return `\n${lead}![${caption}](${rel}){#${id}}\n`;
+      // Taille éventuelle : cf. sizedImagePath().
+      return `\n${lead}![${caption}](${sizedImagePath(rel, w, h)}){#${id}}\n`;
     });
 
     // Recenser les ancres réellement définies dans la note (les deux formes),
@@ -640,11 +638,10 @@ class PandocTypstExportPlugin extends Plugin {
           if (found) {
             const rel = stageImage(found);
             if (rel) {
-              // Image redimensionnée → appel Typst brut (taille plafonnée).
-              if (w !== null || h !== null) {
-                return `\`#box(${obsImageCall(rel, w, h, alt)})\`{=typst}`;
-              }
-              return `![${alt}](${rel})`;
+              // Taille éventuelle : cf. sizedImagePath(). Une image seule
+              // dans son paragraphe avec un alt devient, comme sans taille,
+              // une figure légendée (implicit_figures de Pandoc).
+              return `![${alt}](${sizedImagePath(rel, w, h)})`;
             }
             new Notice(`Image illisible : ${filename}`, 6000);
             return `*(image illisible : ${filename})*`;
@@ -899,10 +896,18 @@ class PandocTypstExportPlugin extends Plugin {
         //                        préfixée de « # » dans la sortie de Pandoc ;
         //   • `table.header(`, `table.hline()` s'écrivent SANS « # » et ne sont
         //     donc jamais touchés par la substitution.
+        // ── 10-bis. Images redimensionnées → obs-image() ────────────────
+        // Chaque  image("obs-sized-N/…"  (chemin marqueur, cf. sizedImagePath)
+        // devient  obs-image("…", w: …, h: …  ; les arguments éventuellement
+        // ajoutés par Pandoc (alt…) et la parenthèse fermante sont conservés.
         try {
-          if (hasObsidianLib) {
-            const typSrc = fs.readFileSync(tmpTyp, "utf8");
-            fs.writeFileSync(tmpTyp, typSrc.replace(/#table\(/g, "#obs-table("), "utf8");
+          if (hasObsidianLib || sizedImages.size) {
+            let typSrc = fs.readFileSync(tmpTyp, "utf8");
+            if (hasObsidianLib) typSrc = typSrc.replace(/#table\(/g, "#obs-table(");
+            for (const [marker, call] of sizedImages) {
+              typSrc = typSrc.split(`image(${typstStr(marker)}`).join(call);
+            }
+            fs.writeFileSync(tmpTyp, typSrc, "utf8");
           }
         } catch (e) {
           console.error("[rfa-pdf-export] Post-traitement du Typst impossible :", e);
